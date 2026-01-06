@@ -26,9 +26,13 @@ import java.io.File
 import java.io.InputStreamReader
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.util.*
+import java.util.concurrent.ConcurrentLinkedQueue
 import javax.swing.SwingUtilities
+import javax.swing.Timer
 import kotlin.io.path.absolutePathString
 
+private const val MAX_LOG_ARCHIVED_COUNT = 1000
 
 class InstanceProcess(val instance: BasicInstance) {
 
@@ -36,8 +40,8 @@ class InstanceProcess(val instance: BasicInstance) {
         private set
     private var exitByUser = false
 
-    private var logArchive = mutableListOf<String>()
-    private var logChannel = Channel<String>(Channel.UNLIMITED)
+    private val logArchive: MutableList<String> = Collections.synchronizedList(LinkedList())
+    private var logChannel = Channel<String>(10000)
     private var viewerUpdater: Job? = null
 
     @OptIn(DelicateCoroutinesApi::class)
@@ -187,7 +191,8 @@ class InstanceProcess(val instance: BasicInstance) {
             launch(Dispatchers.IO) {
                 BufferedReader(InputStreamReader(process.inputStream)).useLines { lines ->
                     lines.forEach { line ->
-                        logChannel.send(line + "\n")
+                        logChannel.send(line)
+                        addLog(line)
                     }
                 }
             }
@@ -198,25 +203,41 @@ class InstanceProcess(val instance: BasicInstance) {
 
             val javaArch = if (javaContainer.arch.contains("64")) "x64" else "x86"
 
-            logChannel.send("${MCSRLauncher.APP_NAME} version: ${MCSRLauncher.APP_VERSION}\n\n\n")
-            logChannel.send("Minecraft folder is:\n${instance.getGamePath().absolutePathString()}\n\n\n")
-            logChannel.send("Java path is:\n${javaContainer.path}\n\n\n")
-            logChannel.send("Java is version: ${javaContainer.version} using $javaArch architecture from ${javaContainer.vendor}\n\n\n")
-            logChannel.send("Java arguments are:\n${arguments.joinToString(" ")}\n\n\n")
-            logChannel.send("Main Class:\n$mainClass\n\n\n")
-            logChannel.send("Mods:\n")
+            val initialLogs = listOf(
+                "${MCSRLauncher.APP_NAME} version: ${MCSRLauncher.APP_VERSION}\n\n",
+                "Minecraft folder is:\n${instance.getGamePath().absolutePathString()}\n\n",
+                "Java path is:\n${javaContainer.path}\n\n",
+                "Java is version: ${javaContainer.version} using $javaArch architecture from ${javaContainer.vendor}\n\n",
+                "Java arguments are:\n${arguments.joinToString(" ")}\n\n",
+                "Main Class:\n$mainClass\n\n",
+                "Mods:"
+            )
+            initialLogs.forEach { message ->
+                addLog(message)
+            }
+
             for (mod in instance.getMods()) {
                 val status = if (mod.isEnabled) "✅" else "❌"
                 val message = "   [$status] ${mod.file.name}${if (!mod.isEnabled) " (disabled)" else ""}"
-                logChannel.send(message + "\n")
+                addLog(message)
             }
 
-            logChannel.send("\n")
+            addLog("\n")
 
             val exitCode = process!!.waitFor()
-            logChannel.send("\nProcess exited with exit code $exitCode")
+            val exitMessage = "\nProcess exited with exit code $exitCode\n"
+            addLog(exitMessage)
             Thread.sleep(2000L)
             onExit(exitCode)
+        }
+    }
+
+    suspend fun addLog(logString: String) {
+        synchronized(logArchive) {
+            logArchive.add(logString)
+            if (logArchive.size > MAX_LOG_ARCHIVED_COUNT) {
+                logArchive.removeAt(0)
+            }
         }
     }
 
@@ -225,15 +246,50 @@ class InstanceProcess(val instance: BasicInstance) {
         viewerUpdater?.cancel()
 
         viewerUpdater = GlobalScope.launch {
+            // Clear previous logs and prepare for new ones
             SwingUtilities.invokeLater {
                 logViewer.updateLogFiles()
-                logViewer.liveLogPane.text = ""
-                logArchive.forEach { logViewer.appendString(logViewer.liveLogPane, it) }
+                logViewer.clearLogs()
+                synchronized(logArchive) {
+                    logViewer.addLogs(logArchive.toList()) // Send a copy of archived logs
+                }
             }
-            for (line in logChannel) {
-                SwingUtilities.invokeLater {
-                    logViewer.appendString(logViewer.liveLogPane, line)
-                    logArchive += line
+
+            val logBuffer = ConcurrentLinkedQueue<String>()
+            val uiTimer = Timer(100) {
+                val logsToProcess = mutableListOf<String>()
+                while (true) {
+                    val log = logBuffer.poll() ?: break
+                    logsToProcess.add(log)
+                }
+
+                if (logsToProcess.isNotEmpty()) {
+                    logViewer.addLogs(logsToProcess)
+                    logViewer.onLiveUpdate()
+                }
+            }
+            uiTimer.start()
+
+            // This coroutine will efficiently consume the channel and buffer logs
+            launch(Dispatchers.IO) {
+                for (line in logChannel) {
+                    logBuffer.add(line)
+                }
+            }
+
+            // When the process ends, stop the timer
+            process?.waitFor()
+            uiTimer.stop()
+
+            // Process any remaining logs after the process has finished
+            SwingUtilities.invokeLater {
+                val logsToProcess = mutableListOf<String>()
+                while (true) {
+                    val log = logBuffer.poll() ?: break
+                    logsToProcess.add(log)
+                }
+                if (logsToProcess.isNotEmpty()) {
+                    logViewer.addLogs(logsToProcess)
                     logViewer.onLiveUpdate()
                 }
             }
